@@ -134,3 +134,32 @@ def test_computed_dynamic_dependency_branch_switching():
 
     right.value = 30
     assert selected.value == 30
+
+
+def test_computed_skips_downstream_recompute_when_upstream_value_stable():
+    source = Signal(1)
+    upstream_runs = 0
+    downstream_runs = 0
+
+    def upstream_fn() -> int:
+        nonlocal upstream_runs
+        upstream_runs += 1
+        return source.value % 2
+
+    upstream = Computed(upstream_fn)
+
+    def downstream_fn() -> int:
+        nonlocal downstream_runs
+        downstream_runs += 1
+        return upstream.value * 10
+
+    downstream = Computed(downstream_fn)
+
+    assert downstream.value == 10
+    assert upstream_runs == 1
+    assert downstream_runs == 1
+
+    source.value = 3  # upstream stays 1, so downstream should skip recompute.
+    assert downstream.value == 10
+    assert upstream_runs == 2
+    assert downstream_runs == 1
