@@ -2177,6 +2177,7 @@ class Computed[T](Variable[T]):
                 self._dep_versions[id(dep)] = dep._version
 
         pm.hook.created(value=self)
+        self._refresh()
 
     def _register_dependency(self, dependency: Variable[Any]) -> None:
         if self._next_deps is not None and dependency is not self:
