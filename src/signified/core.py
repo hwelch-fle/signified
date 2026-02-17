@@ -63,9 +63,9 @@ def computed[R](func: Callable[..., R]) -> Callable[..., Computed[R]]:
     are normalized with :func:`deep_unref`, so ``func`` receives plain Python
     values.
 
-    The created :class:`Computed` subscribes to reactive dependencies found in
-    ``args`` and ``kwargs`` at call time. When any dependency updates, the
-    function is re-evaluated and subscribers are notified.
+    The created :class:`Computed` tracks dependencies dynamically while the
+    wrapped function runs. Any reactive value read during evaluation becomes a
+    dependency for subsequent updates.
 
     Args:
         func: Function that computes a derived value from its inputs.
@@ -97,7 +97,7 @@ def computed[R](func: Callable[..., R]) -> Callable[..., Computed[R]]:
             resolved_kwargs = {key: deep_unref(value) for key, value in kwargs.items()}
             return func(*resolved_args, **resolved_kwargs)
 
-        return Computed(compute_func, (*args, *kwargs.values()))
+        return Computed(compute_func)
 
     return wrapper
 
@@ -1729,7 +1729,7 @@ class ReactiveMixIn[T]:
 
             ```
         """
-        if name == "_value" or not hasattr(self, "_value"):
+        if name.startswith("_") or not hasattr(self, "_value"):
             super().__setattr__(name, value)
         elif hasattr(self.value, name):
             setattr(self.value, name, value)
@@ -1948,6 +1948,31 @@ class Variable[T](ABC, ReactiveMixIn[T]):
         return super().__format__(format_spec)  # Handles other format specs
 
 
+_COMPUTE_STACK: list[Any] = []
+
+
+def _track_read(variable: Variable[Any]) -> None:
+    if not _COMPUTE_STACK:
+        return
+    owner = _COMPUTE_STACK[-1]
+    if owner is not variable:
+        owner._register_dependency(variable)
+
+
+def _object_is(left: Any, right: Any) -> bool:
+    if left is right:
+        if isinstance(left, float) and isinstance(right, float) and left == 0.0 and right == 0.0:
+            return math.copysign(1.0, left) == math.copysign(1.0, right)
+        return True
+    if isinstance(left, float) and isinstance(right, float):
+        if math.isnan(left) and math.isnan(right):
+            return True
+    try:
+        return _is_truthy(left == right)
+    except Exception:
+        return False
+
+
 def unref[T](value: HasValue[T]) -> T:
     """Resolve a value by unwrapping reactive containers until plain data remains.
 
@@ -1971,8 +1996,21 @@ def unref[T](value: HasValue[T]) -> T:
     """
     current: Any = value
     while isinstance(current, Variable):
-        current = current._value
+        current = current.value
     return current
+
+
+def _has_changed(previous: Any, current: Any) -> bool:
+    if callable(previous) or callable(current):
+        return True
+    if isinstance(previous, Variable) or isinstance(current, Variable):
+        return previous is not current
+    if _object_is(previous, current):
+        return False
+    try:
+        return _is_truthy(current != previous)
+    except Exception:
+        return True
 
 
 def has_value[T](obj: Any, type_: type[T]) -> TypeGuard[HasValue[T]]:
@@ -2053,15 +2091,13 @@ class Signal[T](Variable[T]):
     def value(self) -> T:
         """Get or set the current value."""
         pm.hook.read(value=self)
+        _track_read(self)
         return unref(self._value)
 
     @value.setter
     def value(self, new_value: HasValue[T]) -> None:
         old_value = self._value
-        if callable(old_value):
-            change = True
-        else:
-            change = _is_truthy(new_value != old_value)
+        change = _has_changed(old_value, new_value)
         if change:
             self._value = new_value
             pm.hook.updated(value=self)
@@ -2087,18 +2123,18 @@ class Signal[T](Variable[T]):
 class Computed[T](Variable[T]):
     """Read-only reactive value derived from a computation.
 
-    ``Computed`` recalculates its value whenever one of its observed
-    dependencies updates. In most usage, instances are created implicitly via
-    :func:`computed`, operator overloads, or helper APIs such as
-    :func:`reactive_method`.
+    ``Computed`` tracks dependencies as it executes and lazily recalculates the
+    value when it is read after dependencies change. In most usage, instances
+    are created implicitly via :func:`computed`, operator overloads, or helper
+    APIs such as :func:`reactive_method`.
 
-    Unlike :class:`Signal`, ``Computed.value`` is read-only and is updated by
+    Unlike :class:`Signal`, ``Computed.value`` is read-only and updated by
     re-running the stored function.
 
     Args:
         f: Zero-argument function used to compute the current value.
-        dependencies: Dependencies to observe. May be a single item or nested
-            container structure.
+        dependencies: Optional compatibility hint for pre-subscribing to
+            dependencies. Runtime reads still determine the true dependency set.
 
     Example:
         ```py
@@ -2113,32 +2149,78 @@ class Computed[T](Variable[T]):
         ```
     """
 
-    __slots__ = ["f", "_value"]
+    __slots__ = ["f", "_value", "_deps", "_next_deps", "_dirty", "_has_value", "_is_computing"]
 
     def __init__(self, f: Callable[[], T], dependencies: Any = None) -> None:
         super().__init__()
         self.f = f
-        self.observe(dependencies)
-        self._value = unref(self.f())
-        self.notify()
+        self._value: Any = None
+        self._deps = _OrderedWeakrefSet[Variable[Any]]()
+        self._next_deps: _OrderedWeakrefSet[Variable[Any]] | None = None
+        self._dirty = True
+        self._has_value = False
+        self._is_computing = False
+
+        # Backwards-compatible: callers may still pass explicit dependencies.
+        for dep in self._iter_variables(dependencies):
+            if dep is not self:
+                self._deps.add(dep)
+                dep.subscribe(self)
+
         pm.hook.created(value=self)
 
-    def update(self) -> None:
-        """Update the value by re-evaluating the function."""
-        new_value = self.f()
-        if callable(self._value):
-            change = True
-        else:
-            change = _is_truthy(new_value != self._value)
-        if change:
-            self._value: T = new_value
+    def _register_dependency(self, dependency: Variable[Any]) -> None:
+        if self._next_deps is not None and dependency is not self:
+            self._next_deps.add(dependency)
+
+    def _refresh(self) -> None:
+        if self._is_computing:
+            raise RuntimeError("Cycle detected while evaluating Computed")
+
+        previous_value = self._value
+        had_value = self._has_value
+
+        self._is_computing = True
+        self._next_deps = _OrderedWeakrefSet[Variable[Any]]()
+        _COMPUTE_STACK.append(self)
+        try:
+            next_value = self.f()
+        finally:
+            popped = _COMPUTE_STACK.pop()
+            assert popped is self
+            next_deps = self._next_deps
+            self._next_deps = None
+            self._is_computing = False
+
+        assert next_deps is not None
+        for dep in tuple(self._deps):
+            if dep not in next_deps:
+                dep.unsubscribe(self)
+        for dep in tuple(next_deps):
+            if dep not in self._deps:
+                dep.subscribe(self)
+        self._deps = next_deps
+
+        self._dirty = False
+        self._has_value = True
+        if not had_value or _has_changed(previous_value, next_value):
+            self._value = next_value
             pm.hook.updated(value=self)
-            self.notify()
+
+    def update(self) -> None:
+        """Mark this computed stale and propagate invalidation."""
+        if self._dirty:
+            return
+        self._dirty = True
+        self.notify()
 
     @property
     def value(self) -> T:
-        """Get the current value."""
+        """Get the current value, recomputing lazily when stale."""
         pm.hook.read(value=self)
+        _track_read(self)
+        if self._dirty or not self._has_value:
+            self._refresh()
         return unref(self._value)
 
 
@@ -2182,16 +2264,17 @@ def deep_unref(value: Any) -> Any:
     if type(value) in _SCALAR_TYPES:
         return value
 
-    # Base case - if it's a reactive value, unref it
+    # Base case - if it's a reactive value, resolve through `.value` so reads
+    # are tracked while inside computed evaluations.
     if isinstance(value, Variable):
-        return deep_unref(unref(value))
+        return deep_unref(value.value)
 
     # For containers, recursively unref their elements
     if np is not None and isinstance(value, np.ndarray):
         assert np is not None
         return np.array([deep_unref(item) for item in value]).reshape(value.shape) if value.dtype == object else value
     if isinstance(value, dict):
-        return {deep_unref(unref(k)): deep_unref(unref(v)) for k, v in value.items()}
+        return {deep_unref(k): deep_unref(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return type(value)(deep_unref(item) for item in value)
     if isinstance(value, Iterable) and not isinstance(value, str):

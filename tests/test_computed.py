@@ -96,3 +96,41 @@ def test_computed_container_with_deeply_nestedreactive_values():
     assert result.value == [1, 2, 3, 4, 5, 6]
     s[1][0].value = 10
     assert result.value == [1, 10, 3, 4, 5, 6]
+
+
+def test_computed_is_lazy_until_read():
+    source = Signal(2)
+    reads: list[int] = []
+
+    derived = Computed(lambda: reads.append(source.value) or source.value * 10)
+
+    assert reads == []
+    assert derived.value == 20
+    assert reads == [2]
+
+    source.value = 3
+    assert reads == [2]
+    assert derived.value == 30
+    assert reads == [2, 3]
+
+
+def test_computed_dynamic_dependency_branch_switching():
+    use_left = Signal(True)
+    left = Signal(1)
+    right = Signal(10)
+
+    selected = Computed(lambda: left.value if use_left.value else right.value)
+
+    assert selected.value == 1
+
+    right.value = 20
+    assert selected.value == 1
+
+    use_left.value = False
+    assert selected.value == 20
+
+    left.value = 2
+    assert selected.value == 20
+
+    right.value = 30
+    assert selected.value == 30
