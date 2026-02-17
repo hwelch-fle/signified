@@ -1733,6 +1733,8 @@ class ReactiveMixIn[T]:
             super().__setattr__(name, value)
         elif hasattr(self.value, name):
             setattr(self.value, name, value)
+            if isinstance(self, Variable):
+                self._version += 1
             self.notify()
         else:
             super().__setattr__(name, value)
@@ -1763,6 +1765,8 @@ class ReactiveMixIn[T]:
         """
         if isinstance(self.value, (list, dict)):
             self.value[key] = value
+            if isinstance(self, Variable):
+                self._version += 1
             self.notify()
         else:
             raise TypeError(f"'{type(self.value).__name__}' object does not support item assignment")
@@ -1825,12 +1829,13 @@ class Variable[T](ABC, ReactiveMixIn[T]):
         _observers (list[Observer]): List of observers subscribed to this variable.
     """
 
-    __slots__ = ["_observers", "__name", "__weakref__"]
+    __slots__ = ["_observers", "__name", "_version", "__weakref__"]
 
     def __init__(self):
         """Initialize the variable."""
         self._observers = _OrderedWeakrefSet[Observer]()
         self.__name = ""
+        self._version = 0
 
     @staticmethod
     def _iter_variables(item: Any) -> Generator[Variable[Any], None, None]:
@@ -2100,6 +2105,7 @@ class Signal[T](Variable[T]):
         change = _has_changed(old_value, new_value)
         if change:
             self._value = new_value
+            self._version += 1
             pm.hook.updated(value=self)
             self.unobserve(old_value)
             self.observe(new_value)
@@ -2117,6 +2123,7 @@ class Signal[T](Variable[T]):
 
     def update(self) -> None:
         """Update the signal and notify subscribers."""
+        self._version += 1
         self.notify()
 
 
@@ -2149,7 +2156,7 @@ class Computed[T](Variable[T]):
         ```
     """
 
-    __slots__ = ["f", "_value", "_deps", "_next_deps", "_dirty", "_has_value", "_is_computing"]
+    __slots__ = ["f", "_value", "_deps", "_next_deps", "_dirty", "_has_value", "_is_computing", "_dep_versions"]
 
     def __init__(self, f: Callable[[], T], dependencies: Any = None) -> None:
         super().__init__()
@@ -2160,12 +2167,14 @@ class Computed[T](Variable[T]):
         self._dirty = True
         self._has_value = False
         self._is_computing = False
+        self._dep_versions: dict[int, int] = {}
 
         # Backwards-compatible: callers may still pass explicit dependencies.
         for dep in self._iter_variables(dependencies):
             if dep is not self:
                 self._deps.add(dep)
                 dep.subscribe(self)
+                self._dep_versions[id(dep)] = dep._version
 
         pm.hook.created(value=self)
 
@@ -2200,12 +2209,30 @@ class Computed[T](Variable[T]):
             if dep not in self._deps:
                 dep.subscribe(self)
         self._deps = next_deps
+        self._dep_versions = {id(dep): dep._version for dep in tuple(next_deps)}
 
         self._dirty = False
         self._has_value = True
         if not had_value or _has_changed(previous_value, next_value):
             self._value = next_value
+            self._version += 1
             pm.hook.updated(value=self)
+
+    def _dependencies_changed(self) -> bool:
+        for dep in tuple(self._deps):
+            if isinstance(dep, Computed):
+                dep._ensure_uptodate()
+            if self._dep_versions.get(id(dep), -1) != dep._version:
+                return True
+        return False
+
+    def _ensure_uptodate(self) -> None:
+        if not self._dirty and self._has_value:
+            return
+        if self._dirty and self._has_value and not self._dependencies_changed():
+            self._dirty = False
+            return
+        self._refresh()
 
     def update(self) -> None:
         """Mark this computed stale and propagate invalidation."""
@@ -2219,8 +2246,7 @@ class Computed[T](Variable[T]):
         """Get the current value, recomputing lazily when stale."""
         pm.hook.read(value=self)
         _track_read(self)
-        if self._dirty or not self._has_value:
-            self._refresh()
+        self._ensure_uptodate()
         return unref(self._value)
 
 
