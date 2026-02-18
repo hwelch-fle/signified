@@ -13,6 +13,8 @@ from contextlib import contextmanager
 from functools import wraps
 from typing import Any, Callable, Concatenate, Literal, Protocol, Self, SupportsIndex, TypeGuard, Union, cast, overload
 
+from signified.lazy import VariableStore
+
 from .plugins import pm
 from .types import HasValue, ReactiveValue, _OrderedWeakrefSet
 
@@ -35,6 +37,9 @@ __all__ = [
     "reactive_method",
     "as_signal",
 ]
+
+
+_VARIABLE_STORE = VariableStore()
 
 
 class _SupportsAdd[OtherT, ResultT](Protocol):
@@ -1831,11 +1836,13 @@ class Variable[T](ABC, ReactiveMixIn[T]):
 
     __slots__ = ["_observers", "__name", "_version", "__weakref__"]
 
-    def __init__(self):
+    def __init__(self, _store=_VARIABLE_STORE):
         """Initialize the variable."""
         self._observers = _OrderedWeakrefSet[Observer]()
         self.__name = ""
         self._version = 0
+        self._store = _store
+        _store.track(self)
 
     @staticmethod
     def _iter_variables(item: Any) -> Generator[Variable[Any], None, None]:
