@@ -1,32 +1,48 @@
+"""Variable Store for tracking and syncing reactive dependency trees"""
+
+from __future__ import annotations
+
 from collections import defaultdict, deque
 from collections.abc import Generator, Callable, Iterator
 from typing import Any
 
-from .core import Observer, Variable
 from .types import _OrderedWeakrefSet as OWRS, HasValue
+TYPE_CHECKING = False
+if TYPE_CHECKING:
+    # Ditto at end of file to prevent circular
+    from .core import Variable
+    type DepMap = defaultdict[int, OWRS[Variable[Any]]]
 
 
-type DepMap = defaultdict[int, OWRS[Variable[Any]]]
+# Union of types that are never marked as changed
+Valueless = Callable | Generator
 
 
-def changed(was: Any, now: Any) -> bool:
+def changed(variable: Variable[Any]) -> bool:
+    from .core import Variable
+    # Unpack static value and reactive value
+    was, now = variable._value, variable.value
+
+    # Same object
     if was is now:
         return False
+
+    # Both Variables and value has changed
+    if isinstance(was, Variable) and isinstance(now, Variable):
+        return was is not now
     
-    match was, now:
-        case Variable(), Variable():
-            return was is not now
+    # Value is of a `Valueless` type (something that can't be compared)
+    if isinstance(was, Valueless) or isinstance(now, Valueless):
+        return False
 
-        case Generator() | Callable(), Generator() | Callable():
-            return True
-
+    # Check __ne__
     not_equal = was != now
     try:
         return bool(not_equal)
     except ValueError:
-        # numpy array.any()
-        return bool(getattr(not_equal, 'any', lambda: False)())
-    return False
+        # numpy array.any() special case
+        return bool(getattr(not_equal, 'any', lambda: True)())
+    
 
 class VariableStore:
     """Container for tracking state of the current namespace
@@ -43,9 +59,11 @@ class VariableStore:
     """
     def __init__(self, *, max_deps: int| None = None) -> None:
         self.max_stack = max_deps
-        self.tracked = OWRS[Variable[Any]]()
-        self.dep_map: DepMap = defaultdict(OWRS[Variable[Any]])
-        self.stack = deque[Variable[Any]](maxlen=max_deps)
+        self.tracked: OWRS[Variable[Any]] = OWRS[Any]()
+        self.dep_map: DepMap = defaultdict(OWRS[Any])
+
+        # "global" stack for the VariableStore, cleared
+        self.stack: deque[Variable[Any]] = deque(maxlen=max_deps)
 
     def __repr__(self) -> str:
         return f'Tracking: {len(self.tracked)} Variables'
@@ -64,7 +82,7 @@ class VariableStore:
             yield dep
 
     def _prevent_circular(self, variable: Variable[Any]) -> None:
-        # prevent infinite looping
+        # prevent infinite looping by raising RecursionError
         # e.g.
         # >>> x = Signal(1)
         # >>> y = Signal(x)
@@ -76,6 +94,7 @@ class VariableStore:
     
     def refresh(self, variable: Variable[Any]) -> None:
         """Refresh the dependency tree for the provided Variable"""
+        print(f'refreshing {variable}')
         try:
             # get deps
             self.stack.extend(self._get_deps(variable))
@@ -83,10 +102,11 @@ class VariableStore:
             while self.stack:
                 self.refresh(self.stack.pop())
             # detect change
-            if changed(variable._value, variable.value):
+            if changed(variable):
                 # notify subscribers
                 variable.notify()
         finally:
             # Ensure that the stack is cleared if the 
             # refresh fails
             self.stack.clear()
+        print(f'refreshed {variable}')
