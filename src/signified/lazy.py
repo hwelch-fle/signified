@@ -61,6 +61,7 @@ class VariableStore:
         self.max_stack = max_deps
         self.tracked: OWRS[Variable[Any]] = OWRS[Any]()
         self.dep_map: DepMap = defaultdict(OWRS[Any])
+        self.calculating: set[int] = set()
 
         # "global" stack for the VariableStore, cleared
         self.stack: deque[Variable[Any]] = deque(maxlen=max_deps)
@@ -76,7 +77,7 @@ class VariableStore:
         # if at any point we want to support async/paralell updates 
         self.dep_map[id(variable)] = variable._observers # type: ignore (observers should all support Variable interface)
 
-    def _get_deps(self, variable: Variable[Any]) -> Iterator[Variable[Any]]:
+    def get_observers(self, variable: Variable[Any]) -> Iterator[Variable[Any]]:
         self._prevent_circular(variable)
         for dep in self.dep_map.get(id(variable), []):
             yield dep
@@ -92,21 +93,25 @@ class VariableStore:
             if id(dep) == id(variable):
                 raise RecursionError(f'{dep}@{id(dep)} is dependant on self!')
     
-    def refresh(self, variable: Variable[Any]) -> None:
+    def notify_observers(self, variable: Variable[Any]) -> None:
         """Refresh the dependency tree for the provided Variable"""
         print(f'refreshing {variable}')
         try:
+            self.calculating.add(id(self))
             # get deps
-            self.stack.extend(self._get_deps(variable))
+            self.stack.extend(self.get_observers(variable))
             # recursively refresh deps
             while self.stack:
-                self.refresh(self.stack.pop())
+                self.notify_observers(self.stack.pop())
             # detect change
             if changed(variable):
-                # notify subscribers
+                print(f'notifying {list(variable._observers)}')
+                # notify observers
                 variable.notify()
         finally:
             # Ensure that the stack is cleared if the 
             # refresh fails
             self.stack.clear()
+            if id(variable) in self.calculating:
+                self.calculating.remove(id(variable))
         print(f'refreshed {variable}')
